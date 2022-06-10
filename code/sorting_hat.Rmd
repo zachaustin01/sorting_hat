@@ -1,0 +1,476 @@
+---
+title: "Sorting Hat"
+author: "Zach Austin"
+date: "6/9/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+
+rm(list=ls())
+
+
+```
+
+# Set-up
+
+```{r}
+
+project_name = 'sorting_hat'
+
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+repo_path = file.path(substr(getwd(),0,gregexpr(pattern = project_name ,
+                                                getwd())[[1]][1]-2),
+                      project_name)
+
+source(file.path(repo_path,
+                 'code',
+                 'utilities',
+                 'load_directories.r'),
+       local = knitr::knit_global())
+
+p <- c("tidyverse",
+       "readxl"
+)
+
+load_all_packages(p)
+
+
+```
+
+# Data Prep
+
+```{r}
+
+# Inputs
+prior_grade = 1
+n_rooms = 7
+
+f_name = paste0('g',prior_grade,'-',prior_grade+1,'.xlsx')
+
+data <- read_excel(file.path(lake_path,f_name), 
+    sheet = "Data")
+
+keep_together <- read_excel(file.path(lake_path,f_name), 
+    sheet = "KT")
+
+keep_separate <- read_excel(file.path(lake_path,f_name),
+                            sheet = "KS")
+
+attendance <- read_excel(file.path(lake_path,f_name),
+                         sheet = "attendance") %>% 
+  select(student_id,total_abs)
+
+# Need to convert attendance numbers to H,M,L
+
+data = data %>% 
+  left_join(attendance,by="student_id")
+
+priority <- read_excel(file.path(lake_path,f_name),
+                       sheet = "priority")
+
+data_storage = data
+kt_storage = keep_together
+ks_storage = keep_separate
+
+```
+
+```{r}
+
+n_students = nrow(data %>% 
+                    select(student_id) %>% 
+                    unique())
+
+```
+
+
+```{r}
+
+# Logs
+
+logs <- data.frame(matrix(ncol = 3, nrow = 1))
+x <- c("Iter", "Type", "Error")
+colnames(logs) <- x
+
+```
+
+
+# Functions
+
+```{r}
+
+# Returns optimal distribution for desired field
+# - For class distribution, use function but filter data based only on 
+#   students already placed in class
+#
+#   optimal_frequencies(data,'504')
+#   optimal_frequencies(data %>% filter(CLASS_PLACEMENT==1),
+#                      field = '504)
+
+optimal_frequencies <- function(data,field){
+  
+  col = data %>% 
+    select(field) %>% 
+    mutate(N = n()) %>% 
+    group_by(.data[[field]]) %>% 
+    summarize(pct = n()/N) %>% 
+    unique() %>% 
+    arrange(.data[[field]])
+  
+  names(col) = c('value','pct')
+  
+  return(col)
+  
+}
+```
+
+```{r}
+# Returns the error assessment between optimal frequencies and true frequencies
+# for a particular class (done for one column at a time)
+
+assess_error <- function(op_freq,true_freq){
+
+  comp = op_freq %>% 
+    left_join(true_freq,by="value") %>% 
+    mutate(pct.y = ifelse(is.na(pct.y),0,pct.y)) %>% 
+    mutate(res = abs(pct.x - pct.y))
+  
+  return(mean(comp$res)) # Max() may also be a valid option here
+  
+}
+```
+
+```{r}
+# Returns the error for one class across all columns specified in priority
+assess_total_error <- function(data,class_data,priority_df,num_classes){
+  
+  total_error = 0
+  
+  for(i in 1:nrow(priority_df)){
+      
+    field = priority_df$column[i]
+    weight = priority_df$weight[i]
+    
+    op_freq = optimal_frequencies(data = data,field = field)
+    true_freq = optimal_frequencies(data = class_data,field = field)
+    field_error = weight * assess_error(op_freq = op_freq,true_freq = true_freq)
+    
+    total_error = total_error + field_error
+    
+  }
+  
+  # Add penalty if number of students is significantly over expected (so no more
+  # will be added to this class until it approaches expected)
+  
+  students_placed = sum(!is.na(data$CLASS_PLACEMENT))
+  students_in_class = nrow(class_data)
+  penalty = max((students_in_class - students_placed / num_classes) * 3,0)
+
+  return(total_error + penalty)
+  
+}
+```
+
+```{r}
+# Assess grade-level balance
+grade_level_balance <- function(res_data,priority_df,num_classes){
+  
+  t_error = 0
+  
+  for(c_num in (unique(na.omit(res_data$CLASS_PLACEMENT)))){
+    
+    c_error = assess_total_error(data = res_data,
+                       class_data = res_data %>% 
+                         filter(CLASS_PLACEMENT == c_num),
+                       priority_df = priority_df,
+                       num_classes)
+    
+    t_error = t_error + c_error
+    
+  }
+  
+  return(t_error)
+  
+}
+```
+
+```{r}
+# Identify if a student can be assigned to a class (check keep separate)
+# can_be_assigned(results_df,77220,7,ks_storage)
+# can_be_assigned(results_df,77222,7,ks_storage) # Not in keep separate
+# can_be_assigned(results_df,78086,7,ks_storage) # Different keep separate
+
+can_be_assigned <- function(res_data,s_id,class_num,ks_data){
+  
+  if(s_id %in% ks_data$student_id){
+    
+    # Identify list of student IDs that student has to be separate from
+    separate_list = c()
+    
+    groups = ks_data %>% 
+      filter(student_id == s_id) %>% 
+      select(ks_group,ks)
+    
+    for(i in 1:nrow(groups)){
+      
+      row = groups[i,]
+      
+      if(row$ks==0){
+        # Keep separate from "1" in group
+        t = ks_data %>% filter(ks_group == row$ks_group,
+                           ks == 1)
+        separate_list = c(separate_list,t$student_id)
+        
+      } else{
+        # Keep separate from entire group
+        t = ks_data %>% filter(ks_group == row$ks_group,
+                               ks == 0)
+        for(j in 1:nrow(t)){
+          r2 = t[j,]
+          separate_list = c(separate_list,r2$student_id)
+        }
+        
+      }
+      
+    }
+    
+    # Check if any IDs from separate list appear in class list
+    roster = res_data %>% 
+      filter(CLASS_PLACEMENT == class_num)
+    
+    return(length(intersect(roster$student_id,separate_list))==0)
+    
+  } else{
+    return(TRUE)
+  }
+  
+}
+
+```
+
+```{r}
+# Assigns student to a class
+assign_to_class <- function(res_data,s_id,class_num,ks_data){
+  
+  res_data[res_data$student_id==s_id,'CLASS_PLACEMENT'] = class_num  
+  
+  return(res_data)
+  
+}
+
+
+
+```
+
+
+# Results
+
+```{r}
+
+# Build Results Dataframe
+results_df = data %>% 
+  mutate(CLASS_PLACEMENT = NA)
+
+```
+
+```{r}
+
+# Address Keep Together (Big Groups)
+
+keep_together_base = keep_together %>% 
+  mutate(class_id = suppressWarnings(as.numeric(group_id))) %>% 
+  filter(!is.na(class_id))
+
+for(base in unique(keep_together_base$group_id)){
+  
+  students = keep_together %>% 
+    filter(group_id == base)
+  
+  for(s_id in students$student_id){
+    results_df = results_df %>% 
+      assign_to_class(s_id,base,ks_storage)
+  }
+  
+}
+
+
+```
+
+```{r}
+
+# Address Keep Together (Small Groups)
+
+keep_together_non_base =  keep_together %>% 
+  mutate(class_id = suppressWarnings(as.numeric(group_id))) %>% 
+  filter(is.na(class_id))
+
+for(g_id in unique(keep_together_non_base$group_id)){
+  
+  students = keep_together_non_base %>% 
+    filter(group_id == g_id)
+  
+  min_error = 1000
+  min_c = 0
+  
+  for(c in 1:n_rooms){
+    penalty = 0
+    print(paste0('trying group ',g_id,' in room ',c))
+    temp = results_df
+    # Assign all of subgroup to class (temporarily) and check error
+    for(s_id in students$student_id){
+      if(!can_be_assigned(temp,s_id,as.character(c),keep_separate)){penalty=1001}
+      temp = assign_to_class(temp,s_id,as.character(c),keep_separate)
+
+    }
+    err = grade_level_balance(temp,priority,n_rooms) + penalty
+    if(err < min_error){
+      min_error = err
+      min_temp = temp
+      min_c = c
+    }
+    
+    
+  }
+  
+  # Assign best error for real
+  results_df = min_temp
+  print(paste0('assigned group ',g_id,' to room ',min_c))
+  
+
+}
+
+```
+
+```{r}
+
+storage = results_df
+
+```
+
+
+
+```{r}
+
+# Iterate through unassigned students (in order) to assign to best class
+unassigned_students = unique(results_df[is.na(results_df$CLASS_PLACEMENT),'student_id'])
+
+for(s_id in unassigned_students$student_id){
+  
+  min_error = 1000
+  min_c = 0
+  
+  for(c in 1:n_rooms){
+    penalty = 0
+    temp = results_df
+    if(!suppressWarnings(can_be_assigned(temp,s_id,as.character(c),keep_separate))){penalty=1001}
+    temp = assign_to_class(temp,s_id,as.character(c),keep_separate)
+    err = grade_level_balance(temp,priority,n_rooms) + penalty
+    if(err < min_error){
+      min_error = err
+      min_temp = temp
+      min_c = c
+    }
+    
+  }
+  
+  # Assign best error for real
+  results_df = min_temp
+  print(paste0('assigned student ',s_id,' to room ',min_c,' for total error: ',round(min_error,2)))
+  
+  
+}
+
+
+
+```
+
+```{r}
+
+# Write initial results
+
+write.csv(results_df,file.path(lake_path,paste0('initial_results.csv')),row.names = F)
+
+```
+
+
+
+# Swapping Function
+
+```{r}
+
+can_be_swapped <- function(res_data,s_ids,kt_storage,ks_storage){
+  
+  t = res_data[res_data$student_id %in% s_ids,]
+  
+
+  # Check if students are in keep separate across the board
+  if(can_be_assigned(res_data,s_ids[1],t$CLASS_PLACEMENT[2],ks_storage) &
+     can_be_assigned(res_data,s_ids[2],t$CLASS_PLACEMENT[1],ks_storage)){
+    return(T)
+  } else{
+           return(F)
+         }
+
+}
+
+# Grabs n * 2 rows of the dataset randomly and attempts to swap them
+# Will only be run if swap results in error reduction
+
+swap_students <- function(res_data,n_swaps,kt_storage,ks_storage){
+  
+  temp = res_data # return res_data if any blocks, or if error does not decrease
+  
+  cur_error = grade_level_balance(temp,priority,n_rooms)
+  
+  for(n in 1:n_swaps){
+    s = sample(nrow(temp %>% 
+                      filter(!student_id %in% kt_storage$student_id)), 1)
+    samp1 = temp[s, ]
+    s2 = sample(nrow(temp %>% 
+                      filter(!student_id %in% kt_storage$student_id,
+                             CLASS_PLACEMENT!=samp1$CLASS_PLACEMENT[1])), 1)
+    samp2 = temp[s2,]
+    
+    if(can_be_swapped(temp,c(samp1$student_id,samp2$student_id),kt_storage,ks_storage)){
+
+      cp1 = samp1$CLASS_PLACEMENT[1]
+      
+      samp1$CLASS_PLACEMENT = samp2$CLASS_PLACEMENT
+      samp2$CLASS_PLACEMENT = cp1
+      
+      temp[s,] = samp1
+      temp[s2,] = samp2
+      
+
+    } 
+  }
+  
+  new_error = grade_level_balance(temp,priority,n_rooms)
+  
+  if(new_error < cur_error){
+    print('improvement')
+    return(temp)
+  } else{
+    return(results_df)
+  }
+  
+}
+
+```
+
+```{r}
+N = 100
+
+for(i in 1:N){
+  print(paste0('Swap attempt ',i,' out of ',N))
+  results_df = swap_students(results_df,1,kt_storage,ks_storage)
+}
+
+```
+
+

@@ -35,7 +35,8 @@ source(file.path(repo_path,
        local = knitr::knit_global())
 
 p <- c("tidyverse",
-       "readxl"
+       "readxl",
+       "ggplot2"
 )
 
 load_all_packages(p)
@@ -48,13 +49,14 @@ load_all_packages(p)
 ```{r}
 
 # Inputs
-prior_grade = 1
-n_rooms = 7
+prior_grade = 0
+n_rooms = 8
 
 f_name = paste0('g',prior_grade,'-',prior_grade+1,'.xlsx')
 
 data <- read_excel(file.path(lake_path,f_name), 
-    sheet = "Data")
+    sheet = "Data") %>% 
+  select(-dibels)
 
 keep_together <- read_excel(file.path(lake_path,f_name), 
     sheet = "KT")
@@ -66,10 +68,34 @@ attendance <- read_excel(file.path(lake_path,f_name),
                          sheet = "attendance") %>% 
   select(student_id,total_abs)
 
-# Need to convert attendance numbers to H,M,L
+a_quantiles =  attendance %>% 
+  summarize(q1 = quantile(total_abs,probs = .25,na.rm = T),
+            q2 = quantile(total_abs,probs = .5,na.rm = T),
+            q3 = quantile(total_abs,probs = .75,na.rm = T))
+
+attendance = attendance %>% 
+  mutate(attendance = ifelse(is.na(total_abs),0,total_abs)) %>% 
+  mutate(attendance = ifelse(total_abs < a_quantiles$q1,1,
+                            ifelse(total_abs < a_quantiles$q2,2,
+                                   ifelse(total_abs < a_quantiles$q3,3,4))))
+
+dibels <- read_excel(file.path(lake_path,f_name),
+                         sheet = "dibels") 
+
+d_quantiles = dibels %>% 
+  summarize(q1 = quantile(dibels,probs = .25,na.rm = T),
+            q2 = quantile(dibels,probs = .5,na.rm = T),
+            q3 = quantile(dibels,probs = .75,na.rm = T))
+
+dibels = dibels %>% 
+  mutate(dibels = ifelse(is.na(dibels),0,dibels)) %>% 
+  mutate(dibels = ifelse(dibels < d_quantiles$q1,1,
+                            ifelse(dibels < d_quantiles$q2,2,
+                                   ifelse(dibels < d_quantiles$q3,3,4))))
 
 data = data %>% 
-  left_join(attendance,by="student_id")
+  left_join(attendance,by="student_id") %>% 
+  left_join(dibels,by="student_id")
 
 priority <- read_excel(file.path(lake_path,f_name),
                        sheet = "priority")
@@ -93,9 +119,13 @@ n_students = nrow(data %>%
 
 # Logs
 
-logs <- data.frame(matrix(ncol = 3, nrow = 1))
+logs <- data.frame(matrix(ncol = 3, nrow = 0))
 x <- c("Iter", "Type", "Error")
 colnames(logs) <- x
+
+logs_row <- data.frame(matrix(ncol = 3, nrow = 1))
+x <- c("Iter", "Type", "Error")
+colnames(logs_row) <- x
 
 ```
 
@@ -267,8 +297,87 @@ assign_to_class <- function(res_data,s_id,class_num,ks_data){
 
 ```
 
+# Pre-Run Data Quality Checks
 
-# Results
+## KS, KT conflict
+
+```{r}
+
+# Loop through KT and make sure none are on like KS lists
+
+for(g_id in kt_storage$group_id){
+  
+  # Loop through each student in keep together
+  
+  kt_list = kt_storage[kt_storage$group_id==g_id,]$student_id
+  
+  for(s_id in kt_list){
+    
+    # Check if student is on keep separate list
+    
+    ks_view = ks_storage %>% 
+      filter(student_id == s_id)
+    
+    if(nrow(ks_view) > 0){
+      
+      # Loop through appearances
+      for(r in 1:nrow(ks_view)){
+        
+        row = ks_view[r,]
+        # If row is a "1"
+        if(row$ks==1){
+          ks_list = ks_storage %>% 
+            filter(ks_group == row$ks_group,
+                   ks == 0)
+        } else{
+          ks_list = ks_storage %>% 
+            filter(ks_group == row$ks_group,
+                   ks == 1)
+        }
+
+        for(s_id2 in ks_list$student_id){
+          
+          if(s_id2 %in% kt_list){
+            
+            print(paste0('Conflict with ',s_id,' and ',s_id,' in KT group ',g_id))
+            
+          }
+          
+        }
+
+        
+      }
+      
+      
+      
+    }
+    
+    
+  }
+  
+}
+
+
+```
+
+# >1 KT Group
+
+```{r}
+
+temp11 = kt_storage %>% 
+  select(student_id,group_id) %>% 
+  group_by(student_id) %>% 
+  summarize(groups = n()) %>% 
+  arrange(desc(groups)) %>% 
+  filter(groups > 1)
+
+temp11
+
+```
+
+
+
+# Obtain Results
 
 ```{r}
 
@@ -356,6 +465,8 @@ storage = results_df
 
 ```{r}
 
+ITER = 1
+
 # Iterate through unassigned students (in order) to assign to best class
 unassigned_students = unique(results_df[is.na(results_df$CLASS_PLACEMENT),'student_id'])
 
@@ -381,6 +492,12 @@ for(s_id in unassigned_students$student_id){
   # Assign best error for real
   results_df = min_temp
   print(paste0('assigned student ',s_id,' to room ',min_c,' for total error: ',round(min_error,2)))
+  logs_row$Iter = ITER
+  logs_row$Type = "Assign"
+  logs_row$Error = round(min_error,2)
+  logs = rbind(logs,logs_row)
+  
+  ITER = ITER + 1
   
   
 }
@@ -398,6 +515,20 @@ write.csv(results_df,file.path(lake_path,paste0('initial_results.csv')),row.name
 ```
 
 
+
+```{r}
+
+logs %>% 
+  ggplot() + 
+  geom_line(aes(x=Iter,y=Error,color = "Type"))
+
+```
+
+```{r}
+
+storage = results_df
+
+```
 
 # Swapping Function
 
@@ -455,6 +586,11 @@ swap_students <- function(res_data,n_swaps,kt_storage,ks_storage){
   if(new_error < cur_error){
     print('improvement')
     return(temp)
+    logs_row$Iter = ITER
+    logs_row$Type = paste0("Swap",n_swaps)
+    logs_row$Error = round(min_error,2)
+    logs = rbind(logs,logs_row)
+    ITER = ITER + 1
   } else{
     return(results_df)
   }
@@ -464,7 +600,8 @@ swap_students <- function(res_data,n_swaps,kt_storage,ks_storage){
 ```
 
 ```{r}
-N = 100
+
+N = 50
 
 for(i in 1:N){
   print(paste0('Swap attempt ',i,' out of ',N))
@@ -473,4 +610,15 @@ for(i in 1:N){
 
 ```
 
+```{r}
+
+write.csv(results_df,file.path(lake_path,paste0('post_swap_results.csv')),row.names = F)
+
+```
+
+```{r}
+
+
+
+```
 
